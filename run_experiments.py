@@ -3,7 +3,7 @@ import time
 import json
 from tqdm import tqdm
 
-from llms import Agent
+from local_llms import Agent
 import cv2
 import csv
 import os
@@ -103,7 +103,8 @@ class run():
             
       elif self.model_name == 'claude':
           self.model = Agent(model_name=self.MODELS["Anthropic"][2], model = self.model_name, system_message=self.sys_prompt, env=self.env)
-            
+      elif self.model_name == 'qwen':
+            self.model = Agent(model_name="Qwen/Qwen2.5-VL-3B-Instruct", model = self.model_name, system_message=self.sys_prompt, env=self.env)
       if self.model_name != 'rand':   
           self.model_rollout()
 

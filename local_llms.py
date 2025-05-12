@@ -9,7 +9,10 @@ import re
 import os 
 import logging
 from typing import Optional, Dict, Any, List, Tuple
-
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from PIL import Image
+import numpy as np
+import torch
 # Set up logging
 logger = logging.getLogger("atari-gpt.llms")
 
@@ -44,6 +47,9 @@ class Agent():
                 self._init_anthropic_client()
             elif self.model_key == 'gemini':
                 self._init_gemini_client()
+#########support for qwen model#########################
+            elif self.model_key == 'qwen':
+                self._init_qwen_client()
             else:
                 raise ValueError(f"Unsupported model key: {self.model_key}")
         except Exception as e:
@@ -94,6 +100,40 @@ class Agent():
             logger.error(f"Failed to initialize Gemini client: {str(e)}")
             raise
 
+#########support for qwen model#########################
+    def _init_qwen_client(self):
+        """Initialize the local Qwen model using Qwen2_5_VLForConditionalGeneration."""
+        try:
+            # model_path = self.model_name if self.model_name else "Qwen/Qwen2.5-VL-3B-Instruct"
+            model_path = "Qwen/Qwen2.5-VL-3B-Instruct" # Directly use the 3B model
+            logger.info(f"Loading Qwen model and processor from {model_path}")
+
+            # Load the specific processor and model for Qwen2.5-VL
+            self.qwen_processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16, # Use float16 for efficiency
+                device_map="auto",        # Automatically distribute model across available devices
+                trust_remote_code=True,
+                attn_implementation="sdpa" # Use SDPA for potential speedup if available [cite: 7]
+            )
+
+            # Store system message if provided (though Qwen uses it differently in chat)
+            if self.system_message is not None:
+                self.qwen_system_message = self.system_message
+            else:
+                # Default system message (might not be directly used in the same way)
+                self.qwen_system_message = "You are a game playing assistant and will be provided an image. This will be of the game Breakout, your goal is to provide me with what you believe to be the best action I could take to beat the game. Think about all possible actions and why each action is or is not the best action to take. The potential actions I can take are ‘0’: NOOP ‘1’: FIRE ‘2’: RIGHT ‘3’: LEFT. Provide output as a json structured as {reasoning: reasoning for actions and why to choose an action, action: The environment action which would provide the best next state}. The action key should only have the action I should take for the current frame as a number."
+
+            # Reset the standard message list for the new model type
+            self.messages = []
+            # Add system message if using a structure that supports it (optional for Qwen API)
+            # If the base prompt for the game already contains instructions, a separate system message might be less critical.
+
+        except Exception as e:
+            logger.error(f"Failed to initialize Qwen client: {str(e)}")
+            raise
+
     def _get_api_key(self, key_file: str) -> str:
         """
         Get API key from file or environment variable.
@@ -127,7 +167,9 @@ class Agent():
         return base64.b64encode(buffer).decode("utf-8")
     
     def query_LLM(self):
-
+        print("\nInput History for LLM Query:")
+        for message in self.messages:
+            print(message)
         # Check which model to use and prompt the model 
         if self.model_key=='gpt4' or self.model_key=='gpt4o':
             self.response = self.client.chat.completions.create(
@@ -162,6 +204,81 @@ class Agent():
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             })
+#########support for qwen model#########################
+        elif self.model_key == 'qwen':
+            try:
+                # Prepare messages for the template - Extract text/image info
+                # Note: Qwen processor handles the image linking during processing
+                # We just need the structured message list.
+
+                # Use apply_chat_template to format the prompt correctly
+                # It expects the self.messages list directly
+                text_prompt = self.qwen_processor.apply_chat_template(
+                    self.messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+
+                # Extract the last user image to pass to the processor
+                # Assumes the structure in run_experiments sends one image per relevant turn
+                image_to_process = None
+                if hasattr(self, 'last_user_image'):
+                    image_to_process = self.last_user_image
+
+                if image_to_process is None:
+                    # Find the last image in the message history if last_user_image wasn't set
+                    for msg in reversed(self.messages):
+                        if msg['role'] == 'user':
+                            for item in msg['content']:
+                                if item['type'] == 'image' and 'image_obj' in item:
+                                    image_to_process = item['image_obj']
+                                    break
+                        if image_to_process:
+                            break
+
+                if image_to_process is None:
+                    logger.error("No image found to process for Qwen VL model")
+                    # Handle error: maybe return default or raise exception
+                    # For Atari-GPT, an image should always be present in user turns needing action.
+                    raise ValueError("Qwen VL model requires an image input for game turns.")
+
+
+                # Process text and image(s) using the processor instance
+                inputs = self.qwen_processor(
+                    text=[text_prompt], # Pass prompt as a list
+                    images=[image_to_process], # Pass image as a list
+                    return_tensors="pt"
+                ).to(self.qwen_model.device) # Move inputs to the model's device
+
+                # Generate response
+                generated_ids = self.qwen_model.generate(
+                    **inputs,
+                    max_new_tokens=4096 # Or another appropriate value [cite: 9]
+                    # Add other generation parameters if needed (e.g., temperature)
+                )
+
+                # Trim input tokens from generated IDs
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
+                ]
+
+
+                # Decode the response
+                decoded_text = self.qwen_processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False # As per docs example [cite: 9]
+                )[0] # Get the first response string
+
+                # Store response in the expected format for clean_response
+                self.response = {"text": decoded_text}
+                print('\n\nresponse: ', self.response)
+
+            except Exception as e:
+                logger.error(f"Error querying Qwen model: {str(e)}")
+                # Set response to None or empty to indicate failure
+                self.response = {"text": ""} # Or handle error more robustly
+                raise # Re-raise the exception for the main loop to handle if needed
 
         else:
             print('Incorrect Model name given please give correct model name')
@@ -201,6 +318,27 @@ class Agent():
                 self.client = genai.GenerativeModel(model_name = self.model_name, system_instruction=self.system_message, generation_config=generation_config)
             else:
                 self.client = genai.GenerativeModel(model_name = self.model_name, generation_config=generation_config)
+#########support for qwen model#########################
+        elif self.model_key == 'qwen':
+            try:
+                # For local models, we might just need to reset the history
+                self.qwen_history = []
+                logger.info("Reset Qwen chat history")
+                
+                # If model is acting strangely, we might want to reload it
+                if self.reset_count >= 2:
+                    # Reload model
+                    logger.info("Reloading Qwen model")
+                    model_path = self.model_name if self.model_name else "Qwen/Qwen2.5-VL"
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    self.client = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16
+                    )
+            except Exception as e:
+                logger.error(f"Error resetting Qwen model: {str(e)}")
 
         self.reset_count += 1
 
@@ -247,6 +385,8 @@ class Agent():
                 response_text = response.content[0].text
             elif self.model_key == 'gemini':
                 response_text = response.text
+            elif self.model_key == 'qwen':
+                response_text = response["text"]
             else:
                 raise ValueError(f"Unknown model key: {self.model_key}")
             
@@ -502,7 +642,7 @@ class Agent():
                     }
                 )
 
-        elif self.model_key == 'gemini':
+        if self.model_key == 'gemini':
             if frame is not None and user_msg is not None:
                 image_data = self.encode_image(frame)
                 self.messages.append(
@@ -545,7 +685,30 @@ class Agent():
                 )
             else:
                 pass
+#####################support for qwen model#########################
+        elif self.model_key == 'qwen':
+            message_content = []
+            current_image = None # Keep track of the image for this message
 
+            if frame is not None:
+                # Convert frame (numpy array BGR) to PIL Image (RGB)
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                current_image = pil_image # Store the image object
+
+            # IMPORTANT: Qwen expects image *before* text in the content list for a turn
+            if current_image is not None:
+                # Add a placeholder for the image object, will be handled during query_LLM
+                message_content.append({"type": "image", "image_obj": current_image})
+
+            if user_msg is not None:
+                message_content.append({"type": "text", "text": user_msg})
+
+            if message_content:
+                self.messages.append({"role": "user", "content": message_content})
+                # Store the image associated with the last user message for query_LLM
+                self.last_user_image = current_image
+            else:
+                self.last_user_image = None # No image in this user turn
     def add_assistant_message(self, demo_str=None):
 
         if self.model_key =='gpt4' or self.model_key =='gpt4o':
@@ -599,6 +762,17 @@ class Agent():
                         "parts": assistant_msg
                     }
                 )
+        #######support for qwen model#########################
+        elif self.model_key == 'qwen':
+                if demo_str is not None: # Handling demo string if needed
+                    self.messages.append({"role": "assistant", "content": [{"type": "text", "text": demo_str}]})
+                    return
+
+                # Assumes self.response is updated in query_LLM to hold {"text": response_text}
+                if self.response and isinstance(self.response, dict) and "text" in self.response:
+                    response_text = self.response["text"]
+                    # The clean_response function should ensure response_text is the JSON part
+                    self.messages.append({"role": "assistant", "content": [{"type": "text", "text": response_text}]})
 
         else:
             self.messages.append(
@@ -609,6 +783,7 @@ class Agent():
                     ]
                 }
             )
+
 
     def delete_messages(self):
         print('Deleting Set of Messages...')

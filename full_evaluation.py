@@ -24,7 +24,7 @@ logger = logging.getLogger("atari-gpt")
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Run Atari-GPT evaluations')
-    parser.add_argument('--models', nargs='+', default=['rand', 'gpt4', 'gpt4o', 'gemini', 'claude'],
+    parser.add_argument('--models', nargs='+', default=['rand', 'gpt4', 'gpt4o', 'gemini', 'claude','qwen'],
                         help='Models to evaluate (default: all models)')
     parser.add_argument('--games', nargs='+', default=None,
                         help='Specific games to evaluate (default: all games)')
